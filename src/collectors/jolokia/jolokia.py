@@ -15,7 +15,7 @@ name. e.g) ```java.lang:name=ParNew,type=GarbageCollector``` would become
 #### Dependencies
 
  * Jolokia
- * A running JVM with Jolokia installed/configured
+ * At least one JVM with Jolokia installed/configured
 
 #### Example Configuration
 
@@ -26,8 +26,7 @@ will be queried for metrics.
 JolokiaCollector.conf
 
 ```
-    host 'localhost'
-    port '8778'
+    hosts 'jmx@localhost:8778, kafka@localhost:8779,'
     mbeans '"java.lang:name=ParNew,type=GarbageCollector | org.apache.cassandra.metrics:name=WriteTimeouts,type=ClientRequestMetrics"'
 ```
 """
@@ -58,8 +57,7 @@ class JolokiaCollector(diamond.collector.Collector):
         config_help.update({
             'mbeans': "Pipe delimited list of MBeans for which to collect "
             "stats. If not provided, all stats will be collected",
-            'host': 'Hostname',
-            'port': 'Port',
+            'hosts': 'Alias0@Hostname0:Port0, Alias1@Hostname1:Port1,',
         })
         return config_help
 
@@ -67,9 +65,8 @@ class JolokiaCollector(diamond.collector.Collector):
         config = super(JolokiaCollector, self).get_default_config()
         config.update({
             'mbeans': [],
+            'hosts': ['localhost:8778', ],
             'path': 'jmx',
-            'host': 'localhost',
-            'port': 8778,
         })
         return config
 
@@ -83,6 +80,13 @@ class JolokiaCollector(diamond.collector.Collector):
         elif isinstance(self.config['mbeans'], list):
             self.mbeans = self.config['mbeans']
 
+        self.hosts = []
+        if isinstance(self.config['hosts'], basestring):
+            for host in self.config['hosts'].split(','):
+                self.hosts.append(host.strip())
+        elif isinstance(self.config['hosts'], list):
+            self.hosts = self.config['hosts']
+
     def check_mbean(self, mbean):
         if mbean in self.mbeans or not self.mbeans:
             return True
@@ -90,39 +94,45 @@ class JolokiaCollector(diamond.collector.Collector):
             return False
 
     def collect(self):
-        listing = self.list_request()
-        try:
-            domains = listing['value'] if listing['status'] == 200 else {}
-            for domain in domains.keys():
-                if domain not in self.IGNORE_DOMAINS:
-                    obj = self.read_request(domain)
-                    mbeans = obj['value'] if obj['status'] == 200 else {}
-                    for k, v in mbeans.iteritems():
-                        if self.check_mbean(k):
-                            self.collect_bean(k, v)
-        except KeyError:
-            # The reponse was totally empty, or not an expected format
-            self.log.error('Unable to retrieve MBean listing.')
+        for host in self.hosts:
+            matches = re.search('((.+)\@)?([^:]+)(:(\d+))?', host)
+            alias = matches.group(2)
+            if alias == "":
+                alias = None
+            hostname = matches.group(3)
+            port = matches.group(5)
+
+            listing = self.list_request(hostname, port)
+            try:
+                domains = listing['value'] if listing['status'] == 200 else {}
+                for domain in domains.keys():
+                    if domain not in self.IGNORE_DOMAINS:
+                        obj = self.read_request(hostname, port, domain)
+                        mbeans = obj['value'] if obj['status'] == 200 else {}
+                        for k, v in mbeans.iteritems():
+                            if self.check_mbean(k):
+                                self.collect_bean(k, v, alias)
+            except KeyError:
+                # The reponse was totally empty, or not an expected format
+                self.log.error('Unable to retrieve MBean listing.')
 
     def read_json(self, request):
         json_str = request.read()
         return json.loads(json_str)
 
-    def list_request(self):
+    def list_request(self, host, port):
         try:
-            url = "http://%s:%s/%s" % (self.config['host'],
-                                       self.config['port'], self.LIST_URL)
+            url = "http://%s:%s/%s" % (host, port, self.LIST_URL)
             response = urllib2.urlopen(url)
             return self.read_json(response)
         except (urllib2.HTTPError, ValueError):
             self.log.error('Unable to read JSON response.')
             return {}
 
-    def read_request(self, domain):
+    def read_request(self, host, port, domain):
         try:
             url_path = self.READ_URL % urllib.quote(domain)
-            url = "http://%s:%s/%s" % (self.config['host'],
-                                       self.config['port'], url_path)
+            url = "http://%s:%s/%s" % (host, port, url_path)
             response = urllib2.urlopen(url)
             return self.read_json(response)
         except (urllib2.HTTPError, ValueError):
@@ -132,13 +142,17 @@ class JolokiaCollector(diamond.collector.Collector):
     def clean_up(self, text):
         text = re.sub('[:,]', '.', text)
         text = re.sub('[=\s]', '_', text)
+        text = re.sub('["\']', '', text)
         return text
 
-    def collect_bean(self, prefix, obj):
+    def collect_bean(self, prefix, obj, alias=None):
         for k, v in obj.iteritems():
             if type(v) in [int, float, long]:
-                key = "%s.%s" % (prefix, k)
+                if alias is not None:
+                    key = "%s.%s.%s" % (alias, prefix, k)
+                else:
+                    key = "%s.%s" % (prefix, k)
                 key = self.clean_up(key)
                 self.publish(key, v)
             elif type(v) in [dict]:
-                self.collect_bean("%s.%s" % (prefix, k), v)
+                self.collect_bean("%s.%s" % (prefix, k), v, alias)
